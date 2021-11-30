@@ -84,11 +84,13 @@ void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
   }
 }
 
+//cacheline size: 64B
+//pvector size: 24B
 pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   Timer t;
   pvector<WeightT> dist(g.num_nodes(), kDistInf);
   dist[source] = 0;
-  pvector<NodeID> frontier(g.num_edges_directed());
+  pvector<NodeID> frontier(g.num_edges_directed() * 3); //**
   // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
@@ -105,7 +107,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
       size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i=0; i < curr_frontier_tail; i++) {
-        NodeID u = frontier[i];
+        NodeID u = frontier[i * 3]; //**
         if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index))
           RelaxEdges(g, u, delta, dist, local_bins);
       }
@@ -145,6 +147,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
     }
     #pragma omp single
     cout << "took " << iter << " iterations" << endl;
+    //cout << "Size of pvector: " << sizeof(pvector<NodeID>) << endl;
   }
   return dist;
 }
