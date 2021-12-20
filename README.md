@@ -55,6 +55,11 @@ The graph loading infrastructure understands the following formats:
 + `.sg` serialized pre-built graph (use `converter` to make)
 + `.wsg` weighted serialized pre-built graph (use `converter` to make)
 
+Graph Generation
+----------------
++ `./converter -f s10e04.el -e sample-el` output edge list to file sample-el
++ `./converter -f s10e04.el -we sample-wel` output weighted edge list to file sample-wel
++ `./converter -f s10e04.el -swe sample-sym-wel` output symmetrized weighted edge list to file sample-sym-wel
 
 Executing the Benchmark
 -----------------------
