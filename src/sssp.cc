@@ -6,6 +6,7 @@
 #include <iostream>
 #include <queue>
 #include <vector>
+#include <algorithm>
 
 #include "benchmark.h"
 #include "builder.h"
@@ -90,7 +91,8 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   Timer t;
   pvector<WeightT> dist(g.num_nodes(), kDistInf);
   dist[source] = 0;
-  pvector<NodeID> frontier(g.num_edges_directed() * 3); //**
+  int alpha = 100;	//**
+  pvector<NodeID> frontier(g.num_edges_directed());
   // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
@@ -100,16 +102,29 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   {
     vector<vector<NodeID> > local_bins(0);
     size_t iter = 0;
+    int curr_delta_value = static_cast<int>(delta);	//**
+    int new_delta_value = 0;	//**
     while (shared_indexes[iter&1] != kMaxBin) {
       size_t &curr_bin_index = shared_indexes[iter&1];
       size_t &next_bin_index = shared_indexes[(iter+1)&1];
       size_t &curr_frontier_tail = frontier_tails[iter&1];
       size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
+
+      //**
+      for (size_t i=0; i < curr_frontier_tail; i++) {
+	NodeID v = frontier[i];
+	//cout << "Current node is: " << v << endl;
+	new_delta_value = static_cast<int>(dist[v]) + (alpha/static_cast<int>(g.out_degree(v)));
+	//cout << "new_delta_value is: " << new_delta_value << endl;
+	curr_delta_value = std::max(curr_delta_value, new_delta_value);	
+	//cout << "curr_delta_value is: " << curr_delta_value << endl;      
+      }//**
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i=0; i < curr_frontier_tail; i++) {
-        NodeID u = frontier[i * 3]; //**
-        if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index))
-          RelaxEdges(g, u, delta, dist, local_bins);
+        NodeID u = frontier[i];
+	//cout << "vertex " << u << " has " << g.in_degree(u) <<" degree" << endl;
+        if (dist[u] >= curr_delta_value * static_cast<WeightT>(curr_bin_index))
+          RelaxEdges(g, u, curr_delta_value, dist, local_bins);
       }
       while (curr_bin_index < local_bins.size() &&
              !local_bins[curr_bin_index].empty() &&
@@ -117,7 +132,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         vector<NodeID> curr_bin_copy = local_bins[curr_bin_index];
         local_bins[curr_bin_index].resize(0);
         for (NodeID u : curr_bin_copy)
-          RelaxEdges(g, u, delta, dist, local_bins);
+          RelaxEdges(g, u, curr_delta_value, dist, local_bins);
       }
       for (size_t i=curr_bin_index; i < local_bins.size(); i++) {
         if (!local_bins[i].empty()) {
