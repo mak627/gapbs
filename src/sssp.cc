@@ -68,13 +68,16 @@ const size_t kBinSizeThreshold = 1000;
 
 inline
 void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
-                pvector<WeightT> &dist, vector <vector<NodeID>> &local_bins) {
+                pvector<WeightT> &dist, vector <vector<NodeID>> &local_bins, size_t& curr_bin_index) {
   for (WNode wn : g.out_neigh(u)) {
     WeightT old_dist = dist[wn.v];
     WeightT new_dist = dist[u] + wn.w;
     while (new_dist < old_dist) {
       if (compare_and_swap(dist[wn.v], old_dist, new_dist)) {
         size_t dest_bin = new_dist/delta;
+        //cout << "BEFORE dest: " << dest_bin << endl;
+        dest_bin = max(curr_bin_index+1, dest_bin);
+        //cout << "AFTER dest: " << dest_bin << endl;
         if (dest_bin >= local_bins.size())
           local_bins.resize(dest_bin+1);
         local_bins[dest_bin].push_back(wn.v);
@@ -91,48 +94,47 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   Timer t;
   pvector<WeightT> dist(g.num_nodes(), kDistInf);
   dist[source] = 0;
-  int alpha = 100;	//**
+  int alpha = 10;	//**
   pvector<NodeID> frontier(g.num_edges_directed());
   // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
   frontier[0] = source;
   t.Start();
+  float theta = 0.8f;
   #pragma omp parallel
   {
     vector<vector<NodeID> > local_bins(0);
     size_t iter = 0;
-    int curr_delta_value = static_cast<int>(delta);	//**
-    int new_delta_value = 0;	//**
+    int curr_iter_nodes;	//**
     while (shared_indexes[iter&1] != kMaxBin) {
       size_t &curr_bin_index = shared_indexes[iter&1];
       size_t &next_bin_index = shared_indexes[(iter+1)&1];
       size_t &curr_frontier_tail = frontier_tails[iter&1];
       size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
+      curr_iter_nodes = 0;	//**
 
-      //**
-      for (size_t i=0; i < curr_frontier_tail; i++) {
-	NodeID v = frontier[i];
-	//cout << "Current node is: " << v << endl;
-	new_delta_value = static_cast<int>(dist[v]) + (alpha/static_cast<int>(g.out_degree(v)));
-	//cout << "new_delta_value is: " << new_delta_value << endl;
-	curr_delta_value = std::max(curr_delta_value, new_delta_value);	
-	//cout << "curr_delta_value is: " << curr_delta_value << endl;      
-      }//**
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i=0; i < curr_frontier_tail; i++) {
         NodeID u = frontier[i];
-	//cout << "vertex " << u << " has " << g.in_degree(u) <<" degree" << endl;
-        if (dist[u] >= curr_delta_value * static_cast<WeightT>(curr_bin_index))
-          RelaxEdges(g, u, curr_delta_value, dist, local_bins);
+        delta = delta * (1-theta) + theta * (static_cast<WeightT>(alpha)/g.out_degree(u));	//**
+        cout << "DELTA FIRST_UPDATE -----> " << delta << endl;
+        //if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index)){
+            RelaxEdges(g, u, delta, dist, local_bins, curr_bin_index);
+	        curr_iter_nodes++;	//**
+        //}
       }
       while (curr_bin_index < local_bins.size() &&
              !local_bins[curr_bin_index].empty() &&
              local_bins[curr_bin_index].size() < kBinSizeThreshold) {
         vector<NodeID> curr_bin_copy = local_bins[curr_bin_index];
         local_bins[curr_bin_index].resize(0);
-        for (NodeID u : curr_bin_copy)
-          RelaxEdges(g, u, curr_delta_value, dist, local_bins);
+        for (NodeID u : curr_bin_copy){
+            delta = delta * (1-theta) + theta * (static_cast<WeightT>(alpha)/g.out_degree(u));	//**
+            cout << "DELTA SECOND_UPDATE -----> " << delta << endl;
+            RelaxEdges(g, u, delta, dist, local_bins, curr_bin_index);
+            curr_iter_nodes++;	//**
+        }
       }
       for (size_t i=curr_bin_index; i < local_bins.size(); i++) {
         if (!local_bins[i].empty()) {
@@ -157,12 +159,16 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
              local_bins[next_bin_index].end(), frontier.data() + copy_start);
         local_bins[next_bin_index].resize(0);
       }
+      //cout << "No of vertices in current iteration " << iter << " are: " << curr_iter_nodes << endl;
       iter++;
       #pragma omp barrier
     }
     #pragma omp single
     cout << "took " << iter << " iterations" << endl;
     //cout << "Size of pvector: " << sizeof(pvector<NodeID>) << endl;
+  }
+  for (int i = 0; i < dist.size(); i++){
+    cout << "The distance to the node " << i << "is: " << dist[i] << endl;
   }
   return dist;
 }
