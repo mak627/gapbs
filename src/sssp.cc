@@ -66,6 +66,7 @@ using namespace std;
 const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
 const size_t kBinSizeThreshold = 1000;
+const size_t MAX_UPDATE_ITER = 5;
 
 inline
 void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
@@ -80,8 +81,9 @@ void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
         if (dest_bin >= local_bins.size())
           local_bins.resize(dest_bin+1);
         local_bins[dest_bin].push_back(wn.v);
-        /* Since, within each step, Bellman-Ford algorithm runs as substeps, we get unordered relaxation.
-           So relaxation through the visited nodes need to be reconsidered, if visited nodes get lower distance during update.
+        /*
+        Since, within each step, Bellman-Ford algorithm runs as substeps, we get unordered relaxation.
+        So relaxation through the visited nodes need to be reconsidered, if visited nodes get lower distance during update.
         */
         if (visited[wn.v])
           visited[wn.v] = false;
@@ -99,15 +101,16 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   pvector<WeightT> dist(g.num_nodes(), kDistInf);
   pvector<bool> visited(g.num_nodes(), false);
   dist[source] = 0;
-  int alpha = 500;	//**
+  int alpha = 1000;	//**
   pvector<NodeID> frontier(g.num_edges_directed());
   // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
   frontier[0] = source;
   t.Start();
-  float theta = 0.75;
-  delta = 1;
+  float theta1 = 0.25;
+  float theta2 = (1 - theta1) * alpha;
+  //size_t MAX_UPDATE_ITER = 5;
   #pragma omp parallel
   {
     vector<vector<NodeID>> local_bins(0);
@@ -119,6 +122,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
       size_t &next_bin_index = shared_indexes[(iter+1)&1];
       size_t &curr_frontier_tail = frontier_tails[iter&1];
       size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
+      float delta_local = delta;
       curr_iter_nodes = 0;
 
       #pragma omp for nowait schedule(dynamic, 64)
@@ -127,16 +131,18 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         NodeID u = frontier[i];
         if (!visited[u])
         {
-            delta = delta * (1 - theta) + theta * (static_cast<WeightT>(alpha) / g.out_degree(u));
+            if (iter < MAX_UPDATE_ITER)
+                delta_local = delta_local * theta1 + theta2 / g.out_degree(u);
             visited[u] = true;
-            RelaxEdges(g, u, delta, dist, local_bins, visited, curr_bin_index);
-	        curr_iter_nodes++;
-	     }
+            RelaxEdges(g, u, delta_local, dist, local_bins, visited, curr_bin_index);
+            curr_iter_nodes++;
+        }
       }
-
-      // This part is bucket fusion optimization
-      // If distances get updated such that some new nodes are again added to current local bin,
-      // they're directly processed in current thread without having to go to next iteration
+      /*
+      This part is bucket fusion optimization
+      If distances get updated such that some new nodes are again added to current local bin,
+      they're directly processed in current thread without having to go to next iteration
+      */
       while (curr_bin_index < local_bins.size() &&
              !local_bins[curr_bin_index].empty() &&
              local_bins[curr_bin_index].size() < kBinSizeThreshold)
@@ -145,11 +151,12 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         local_bins[curr_bin_index].resize(0);
         for (NodeID u : curr_bin_copy)
         {
-          delta = delta * (1 - theta) + theta * (static_cast<WeightT>(alpha)/g.out_degree(u));
-          visited[u] = true;
-          RelaxEdges(g, u, delta, dist, local_bins, visited, curr_bin_index);
-          curr_iter_nodes++;
-	      }
+            if (iter < MAX_UPDATE_ITER)
+		        delta_local = delta_local * theta1 + theta2 / g.out_degree(u);
+            visited[u] = true;
+            RelaxEdges(g, u, delta_local, dist, local_bins, visited, curr_bin_index);
+            curr_iter_nodes++;
+        }
       }
       for (size_t i=curr_bin_index; i < local_bins.size(); i++)
       {
@@ -160,6 +167,10 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
           break;
         }
       }
+
+      // Update delta based on thread local delta values
+      if (iter < MAX_UPDATE_ITER)
+        fetch_and_add(delta, delta_local);
       #pragma omp barrier
       #pragma omp single nowait
       {
@@ -168,26 +179,34 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         t.Start();
         curr_bin_index = kMaxBin;
         curr_frontier_tail = 0;
+        if (iter < MAX_UPDATE_ITER)
+          delta /= (1 + omp_get_num_threads());
       }
       if (next_bin_index < local_bins.size())
       {
-        // Following step performs the action:
-        // set copy_start = next_frontier_tail (1, if at first iteration, since only one source node in frontier)
-        // atomically update next frontier tail value based on next bin size (cur frontier tail value for next step iterations)
-        // since next_frontier tail is global, each thread updates this value to get the total frontier size for next step
-        // next_frontier_tail = next_frontier_tail + local_bins[next_bin_index].size()
+        /*
+        Following step performs the action:
+        set copy_start = next_frontier_tail (1, if at first iteration, since only one source node in frontier)
+        atomically update next frontier tail value based on next bin size (curr frontier tail value for next step iteration)
+        since next_frontier tail is global, each thread updates this value to get the total frontier size for next step
+        next_frontier_tail = next_frontier_tail + local_bins[next_bin_index].size()
+        */
         size_t copy_start = fetch_and_add(next_frontier_tail,
                                           local_bins[next_bin_index].size());
 
-        // Assign local next bin data to global frontier (because at each step, we process all nodes in current frontier)
-        // *(frontier_address + copy_start) = local_bins[next_bin_index] values from start to end
-        // Each threads copies local bin data to frontier (address offset by copy_start (next_frontier_tail) value)
-        // previous frontier content get overwritten
+        /*
+        Assign local next bin data to global frontier (because at each step, we process all nodes in current frontier)
+        *(frontier_address + copy_start) = local_bins[next_bin_index] values from start to end
+        Each threads copies local bin data to frontier (address offset by copy_start (next_frontier_tail) value)
+        previous frontier content get overwritten
+        */
         copy(local_bins[next_bin_index].begin(),
              local_bins[next_bin_index].end(), frontier.data() + copy_start);
 
-        // resize the local_bins at next_bin_index to zero, since its nodes have been moved to frontier
-        // if in the next step, further nodes are added due to updated distance, these will be new nodes, not present in frontier
+        /*
+        resize the local_bins at next_bin_index to zero, since its nodes have been moved to frontier
+        if in the next step, further nodes are added due to updated distance, these will be new nodes, not present in frontier
+        */
         local_bins[next_bin_index].resize(0);
       }
       iter++;
@@ -196,8 +215,6 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
     #pragma omp single
     cout << "took " << iter << " iterations" << endl;
   }
-  cout << "The distance to the last node is: " << dist[g.num_nodes() - 1] << endl;
-  cout << "Delta value is " << delta << endl;
   return dist;
 }
 
