@@ -94,6 +94,18 @@ void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,
   }
 }
 
+inline
+WeightT distWeight(const WGraph &g, NodeID u){
+    WeightT alphaWeight = 0;
+    size_t deg_thres_cnt = 0;
+    for(WNode wn : g.out_neigh(u)){
+        deg_thres_cnt++;
+        if(wn.w > alphaWeight) { alphaWeight = wn.w;}
+        if(deg_thres_cnt > 10) { break; }
+    }
+    return alphaWeight;
+}
+
 //cacheline size: 64B
 //pvector size: 24B
 pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
@@ -101,7 +113,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   pvector<WeightT> dist(g.num_nodes(), kDistInf);
   pvector<bool> visited(g.num_nodes(), false);
   dist[source] = 0;
-  int alpha = 1000;	//**
+  //int alpha = 1000;	//**
   pvector<NodeID> frontier(g.num_edges_directed());
   // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
   size_t shared_indexes[2] = {0, kMaxBin};
@@ -109,7 +121,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   frontier[0] = source;
   t.Start();
   float theta1 = 0.25;
-  float theta2 = (1 - theta1) * alpha;
+  //float theta2 = (1 - theta1) * alpha;
   //size_t MAX_UPDATE_ITER = 5;
   #pragma omp parallel
   {
@@ -131,8 +143,10 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         NodeID u = frontier[i];
         if (!visited[u])
         {
-            if (iter < MAX_UPDATE_ITER)
-                delta_local = delta_local * theta1 + theta2 / g.out_degree(u);
+            if (iter < MAX_UPDATE_ITER && g.out_degree(u) > 0){
+                WeightT aW = distWeight(g, u);
+                delta_local = delta_local * theta1 + ((1 - theta1) * aW) / g.out_degree(u);
+            }
             visited[u] = true;
             RelaxEdges(g, u, delta_local, dist, local_bins, visited, curr_bin_index);
             curr_iter_nodes++;
@@ -151,8 +165,10 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         local_bins[curr_bin_index].resize(0);
         for (NodeID u : curr_bin_copy)
         {
-            if (iter < MAX_UPDATE_ITER)
-		        delta_local = delta_local * theta1 + theta2 / g.out_degree(u);
+            if (iter < MAX_UPDATE_ITER&& g.out_degree(u) > 0){
+                WeightT bW = distWeight(g, u);
+		        delta_local = delta_local * theta1 + ((1 - theta1) * bW) / g.out_degree(u);
+            }
             visited[u] = true;
             RelaxEdges(g, u, delta_local, dist, local_bins, visited, curr_bin_index);
             curr_iter_nodes++;
