@@ -120,13 +120,15 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   t.Start();
   int count = 0;
   int threshold = 0;
-  //delta = 1;
+  delta = 1;
   //cout << "Node " << source << endl; // 9695438
   bool delta_update = true;
+  int nthreads;
   #pragma omp parallel
   {
     vector<vector<NodeID>> local_bins(0);
     size_t iter = 0;
+    if(omp_get_thread_num() == 0) nthreads = omp_get_num_threads();
     while (shared_indexes[iter&1] != kMaxBin)
     {
       size_t &curr_bin_index = shared_indexes[iter&1];
@@ -144,7 +146,7 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
           // Remove <= by < later on, and delta should be kept to 1, 0 initial delta just means don't explore
           if (dist[u] >= threshold &&  g.out_degree(u) != 0)
           {
-            delta_local = medianWeight(g, u, false);
+            delta_local = max((nthreads / static_cast<int>(g.out_degree(u))), 1) * medianWeight(g, u, false);
             // Update delta based on thread local delta values
             fetch_and_add(delta, delta_local);
             fetch_and_add(count, 1);
