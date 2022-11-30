@@ -16,6 +16,7 @@
 #include "platform_atomics.h"
 #include "pvector.h"
 #include "timer.h"
+#include "util.h"
 
 /*
 GAP Benchmark Suite
@@ -65,7 +66,7 @@ using namespace std;
 const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
 const size_t kBinSizeThreshold = 1000;
-const size_t MAX_UPDATE_ITER = 10;
+const size_t MAX_UPDATE_ITER = 5;
 const size_t MAX_DEG_COUNT = 15;
 
 inline
@@ -80,7 +81,6 @@ void RelaxEdges(const WGraph &g, NodeID u, WeightT delta,  WeightT threshold,
         size_t dest_bin = curr_bin_index + (new_dist - threshold) / delta;
         if (iter < MAX_UPDATE_ITER - 1)
           dest_bin = min(dest_bin, curr_bin_index + 1);
-        dest_bin = max(dest_bin, curr_bin_index);
         if (dest_bin >= local_bins.size())
           local_bins.resize(dest_bin+1);
         local_bins[dest_bin].push_back(wn.v);
@@ -110,6 +110,7 @@ inline WeightT medianWeight(const WGraph &g, NodeID u, bool returnMax = false){
 //pvector size: 24B
 pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   Timer t;
+  double t_tot = 0.;
   pvector<WeightT> dist(g.num_nodes(), kDistInf);
   dist[source] = 0;
   pvector<NodeID> frontier(g.num_edges_directed());
@@ -117,18 +118,16 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
   size_t shared_indexes[2] = {0, kMaxBin};
   size_t frontier_tails[2] = {1, 0};
   frontier[0] = source;
-  t.Start();
-  int count = 0;
+  //t.Start();
+  int cnt = 1;
   int threshold = 0;
-  delta = 1;
-  //cout << "Node " << source << endl; // 9695438
+  //cout << "Startine Node--->" << source << endl;
   bool delta_update = true;
-  int nthreads;
   #pragma omp parallel
   {
-    vector<vector<NodeID>> local_bins(0);
+    vector<vector<NodeID>> local_bins(0);   //vector<NodeID> max_size() --> 4611686018427387903
     size_t iter = 0;
-    if(omp_get_thread_num() == 0) nthreads = omp_get_num_threads();
+    int num_threads = omp_get_num_threads();
     while (shared_indexes[iter&1] != kMaxBin)
     {
       size_t &curr_bin_index = shared_indexes[iter&1];
@@ -139,31 +138,33 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
 
       if (delta_update)
       {
+        #pragma omp single
+        t.Start();
         #pragma omp for schedule(dynamic, 64)
         for (size_t i = 0; i < curr_frontier_tail; i++)
         {
           NodeID u = frontier[i];
-          // Remove <= by < later on, and delta should be kept to 1, 0 initial delta just means don't explore
-          if (dist[u] >= threshold &&  g.out_degree(u) != 0)
+          int out_degree = g.out_degree(u);
+          if (dist[u] >= threshold &&  out_degree != 0)
           {
-            delta_local = max((nthreads / static_cast<int>(g.out_degree(u))), 1) * medianWeight(g, u, false);
+            delta_local = max(num_threads / out_degree, 1) * medianWeight(g, u, false);
             // Update delta based on thread local delta values
             fetch_and_add(delta, delta_local);
-            fetch_and_add(count, 1);
+            fetch_and_add(cnt, 1);
 	        }
         }
-        //#pragma omp barrier
         #pragma omp single
         {
-          if (count > 1)
+          if (cnt > 1)
           {
-            delta /= count;
-            count = 1;
+            delta /= cnt;
+            cnt = 1;
           }
+          t.Stop();
+          t_tot += t.Seconds(); // overhead added by adaptive delta calculation part
         }
-        #pragma omp barrier
       }
-
+      #pragma omp barrier
       #pragma omp for nowait schedule(dynamic, 64)
       for (size_t i = 0; i < curr_frontier_tail; i++)
       {
@@ -175,9 +176,8 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
         else if (dist[u] >= threshold)
         {
 	        size_t dest_bin = curr_bin_index;
-	        dest_bin += iter < MAX_UPDATE_ITER - 1? 1: (dist[u] - threshold) / delta;
-	        dest_bin = max(dest_bin, curr_bin_index);
-            if (dest_bin >= local_bins.size())
+	        dest_bin += (iter < MAX_UPDATE_ITER - 1) ? 1 : (dist[u] - threshold) / delta;
+            if(dest_bin >= local_bins.size())
                 local_bins.resize(dest_bin+1);
 	        local_bins[dest_bin].push_back(u);
         }
@@ -206,9 +206,9 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
       #pragma omp barrier
       #pragma omp single nowait
       {
-        t.Stop();
+        //t.Stop();
         //PrintStep(curr_bin_index, t.Millisecs(), curr_frontier_tail);
-        t.Start();
+        //t.Start();
         // Set flag to change delta to true, if the next iteration is
         // within max update iterations and the bin index has changed
         if (iter < MAX_UPDATE_ITER - 1 && next_bin_index != curr_bin_index)
@@ -245,8 +245,9 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
     }
     #pragma omp single
     {
-        cout << "took " << iter << " iterations" << endl;
-        cout << "FINAL_DELTA_VALUE: " << delta << endl;
+        cout << "took " << iter << " iterations." << endl;
+        //cout << "FINAL_DELTA_VALUE: " << delta << endl;
+        PrintTime("Overhead Time", t_tot);
     }
   }
   return dist;
@@ -286,7 +287,7 @@ bool SSSPVerifier(const WGraph &g, NodeID source,
   bool all_ok = true;
   for (NodeID n : g.vertices()) {
     if (dist_to_test[n] != oracle_dist[n]) {
-      cout << n << ": " << dist_to_test[n] << " != " << oracle_dist[n] << endl;
+      //cout << n << ": " << dist_to_test[n] << " != " << oracle_dist[n] << endl;
       all_ok = false;
     }
   }
